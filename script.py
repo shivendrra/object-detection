@@ -15,7 +15,7 @@ frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 resize_h = int(frame_h * (RESIZE_WIDTH / frame_w))
 
 out = cv2.VideoWriter(OUTPUT_PATH, cv2.VideoWriter_fourcc(*'mp4v'), fps, (RESIZE_WIDTH, resize_h))
-bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=25, detectShadows=False)   # bg subtract
+bg_subtractor = cv2.createBackgroundSubtractorKNN(history=MAX_HISTORY, dist2Threshold=400, detectShadows=True)   # bg subtract
 mask_history = deque(maxlen=MAX_HISTORY)  # history buffers
 
 while True:
