@@ -4,6 +4,9 @@ import threading
 import queue
 import time
 
+fps_display = 0.0
+last_time = time.time()
+
 # Use CUDA if available
 use_cuda = cv2.cuda.getCudaEnabledDeviceCount() > 0
 
@@ -55,7 +58,6 @@ def worker(input_q, output_q, reference_gray, resize_dim):
       d_now = cv2.cuda_GpuMat()
       d_ref.upload(reference_gray)
       d_now.upload(gray)
-
       d_diff = cv2.cuda.absdiff(d_ref, d_now)
       diff = d_diff.download()
     else:
@@ -95,6 +97,9 @@ def worker(input_q, output_q, reference_gray, resize_dim):
     heat_mask = cv2.bitwise_or(added_mask, removed_mask)
     overlay = apply_global_heatmap_cuda(frame, heat_mask)
     output_q.put((frame_id, overlay))
+    cv2.imshow("Overlay", overlay)
+    if cv2.waitKey(1) & 0xFF == 27:
+      break
 
 # --- MAIN ---
 VIDEO_IN = "data/input.mp4"
@@ -112,6 +117,7 @@ resize_dim = (RESIZE_W, h1)
 ref_frame, reference_gray = preprocess_frame(ref_frame, resize_dim)
 
 fps = cap.get(cv2.CAP_PROP_FPS)
+print("video file fps: ", fps)
 out = cv2.VideoWriter(VIDEO_OUT, cv2.VideoWriter_fourcc(*'mp4v'), fps, resize_dim)
 
 input_q = queue.Queue(maxsize=10)
@@ -133,10 +139,19 @@ while True:
   while not output_q.empty():
     fid, processed = output_q.get()
     output_buffer[fid] = processed
-
+  now = time.time()
+  delta = now - last_time
+  last_time = now
+  fps_current = 1.0 / delta if delta > 0 else 0.0
+  fps_display = 0.9 * fps_display + 0.1 * fps_current  # smooth FPS
   while frame_id in output_buffer:
-    out.write(output_buffer[frame_id])
-    del output_buffer[frame_id]
+    overlay = output_buffer[frame_id]
+    cv2.putText(overlay, f"FPS: {fps_display:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1)
+    cv2.imshow("Overlay", overlay)  # showing updated frame with FPS
+    if cv2.waitKey(1) & 0xFF == 27:
+      break
+    out.write(overlay)
+    del overlay
     frame_id += 1
 
 input_q.put(None)
