@@ -1,91 +1,145 @@
 import cv2
 import numpy as np
-from collections import deque
+import threading
+import queue
+import time
 
-# Constants
-FRAME_BUFFER = 30  # how long to persist the overlay after disappearance
-X_SPACING = 15
-Y_SPACING = 15
-VIDEO_PATH = "data/input.mp4"
-OUTPUT_PATH = "data/output.mp4"
-MAX_HISTORY = 100 # number of past masks to store
-MIN_AREA = 500 # min area to consider as object
-RESIZE_WIDTH = 640 # resizing width for faster processing
-removed_objects = deque(maxlen=100)
-heatmaps = deque(maxlen=100)
+# Use CUDA if available
+use_cuda = cv2.cuda.getCudaEnabledDeviceCount() > 0
 
-# pplying heatmap
-def apply_heatmap(diff):
-  heatmap = cv2.applyColorMap(diff, cv2.COLORMAP_JET)
-  return heatmap
+def preprocess_frame(frame, size):
+  frame = cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
+  gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+  return frame, gray
 
-# overlaying text and bounding boxes with symbols
-def draw_removed_overlay(frame, contours, timestamp):
-  overlay = frame.copy()
-  for cnt in contours:
-    if cv2.contourArea(cnt) < 500:
-      continue
-    x, y, w, h = cv2.boundingRect(cnt)
-    mask = np.zeros((frame.shape[0], frame.shape[1]), dtype=np.uint8)
-    cv2.drawContours(mask, [cnt], -1, 255, -1)
-    
-    # putting red Xs over masked region
-    for yy in range(y, y + h, Y_SPACING):
-      for xx in range(x, x + w, X_SPACING):
-        if mask[yy, xx] == 255:
-          cv2.putText(overlay, 'X', (xx, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), 2)
-    cv2.putText(overlay, 'Missing object', (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-    
-    removed_objects.append((timestamp, overlay.copy()))
+def apply_global_heatmap_cuda(frame, mask, alpha=0.4):
+  if cv2.countNonZero(mask) == 0:
+    return frame
+  heatmap = cv2.applyColorMap(mask, cv2.COLORMAP_JET)
+  return cv2.addWeighted(frame, 1 - alpha, heatmap, alpha, 0)
 
-cap = cv2.VideoCapture(VIDEO_PATH)
+def merge_boxes(boxes, overlapThresh=0.3):
+  if not boxes: return []
+  boxes_np = np.array(boxes)
+  x1 = boxes_np[:, 0]
+  y1 = boxes_np[:, 1]
+  x2 = boxes_np[:, 0] + boxes_np[:, 2]
+  y2 = boxes_np[:, 1] + boxes_np[:, 3]
+
+  areas = (x2 - x1 + 1) * (y2 - y1 + 1)
+  idxs = np.argsort(y2)
+  pick = []
+  while len(idxs) > 0:
+    last = idxs[-1]
+    pick.append(last)
+    xx1 = np.maximum(x1[last], x1[idxs[:-1]])
+    yy1 = np.maximum(y1[last], y1[idxs[:-1]])
+    xx2 = np.minimum(x2[last], x2[idxs[:-1]])
+    yy2 = np.minimum(y2[last], y2[idxs[:-1]])
+    w = np.maximum(0, xx2 - xx1 + 1)
+    h = np.maximum(0, yy2 - yy1 + 1)
+    overlap = (w * h) / areas[idxs[:-1]]
+    idxs = idxs[np.where(overlap <= overlapThresh)]
+  return [boxes[i] for i in pick]
+
+def worker(input_q, output_q, reference_gray, resize_dim):
+  kernel = np.ones((5, 5), np.uint8)
+  while True:
+    item = input_q.get()
+    if item is None: break
+    frame_id, frame = item
+    frame, gray = preprocess_frame(frame, resize_dim)
+
+    if use_cuda:
+      d_ref = cv2.cuda_GpuMat()
+      d_now = cv2.cuda_GpuMat()
+      d_ref.upload(reference_gray)
+      d_now.upload(gray)
+
+      d_diff = cv2.cuda.absdiff(d_ref, d_now)
+      diff = d_diff.download()
+    else:
+      diff = cv2.absdiff(reference_gray, gray)
+
+    _, binary_diff = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    opened = cv2.morphologyEx(binary_diff, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    raw_boxes = [(x, y, w, h) for cnt in contours
+                 if cv2.contourArea(cnt) > 400
+                 for x, y, w, h in [cv2.boundingRect(cnt)]]
+    merged_boxes = merge_boxes(raw_boxes)
+
+    added_mask = np.zeros_like(gray)
+    removed_mask = np.zeros_like(gray)
+
+    for x, y, w, h in merged_boxes:
+      region_ref = reference_gray[y:y+h, x:x+w]
+      region_now = gray[y:y+h, x:x+w]
+      mean_diff = np.mean(region_now) - np.mean(region_ref)
+
+      if abs(mean_diff) < 5:
+        continue
+      if mean_diff > 10:
+        removed_mask[y:y+h, x:x+w] = 255
+        label = "Missing"
+        color = (0, 0, 255)
+      else:
+        added_mask[y:y+h, x:x+w] = 255
+        label = "Added"
+        color = (0, 255, 0)
+
+      cv2.rectangle(frame, (x, y), (x+w, y+h), color, 2)
+      cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    heat_mask = cv2.bitwise_or(added_mask, removed_mask)
+    overlay = apply_global_heatmap_cuda(frame, heat_mask)
+    output_q.put((frame_id, overlay))
+
+# --- MAIN ---
+VIDEO_IN = "data/input.mp4"
+VIDEO_OUT = "data/output.mp4"
+RESIZE_W = 640
+
+cap = cv2.VideoCapture(VIDEO_IN)
+ret, ref_frame = cap.read()
+if not ret:
+  raise RuntimeError("Cannot read input video")
+
+h0, w0 = ref_frame.shape[:2]
+h1 = int(h0 * RESIZE_W / w0)
+resize_dim = (RESIZE_W, h1)
+ref_frame, reference_gray = preprocess_frame(ref_frame, resize_dim)
+
 fps = cap.get(cv2.CAP_PROP_FPS)
-frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-resize_h = int(frame_h * (RESIZE_WIDTH / frame_w))
+out = cv2.VideoWriter(VIDEO_OUT, cv2.VideoWriter_fourcc(*'mp4v'), fps, resize_dim)
 
-ret, prev = cap.read()
-out = cv2.VideoWriter(OUTPUT_PATH, cv2.VideoWriter_fourcc(*'mp4v'), fps, (RESIZE_WIDTH, resize_h))
-prev = cv2.resize(prev, (RESIZE_WIDTH, resize_h))  # make sure prev frame is resized too
-prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
-frame_count = 0
+input_q = queue.Queue(maxsize=10)
+output_q = queue.Queue()
+
+worker_thread = threading.Thread(target=worker, args=(input_q, output_q, reference_gray, resize_dim))
+worker_thread.start()
+
+frame_id = 0
+output_buffer = {}
 
 while True:
   ret, frame = cap.read()
-  if not ret:
-    break
-  frame = cv2.resize(frame, (RESIZE_WIDTH, resize_h))
-  frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+  if not ret: break
 
-  diff = cv2.absdiff(prev_gray, frame_gray)   # Frame differencing
-  _, thresh = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-  dilated = cv2.dilate(thresh, None, iterations=2)
+  if not input_q.full():
+    input_q.put((frame_id, frame))
 
-  contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)   # Get contours of removed objects
-  global_heatmap = apply_heatmap(cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX))
-  heatmaps.append((frame_count, global_heatmap.copy()))
-  draw_removed_overlay(frame, contours, frame_count)  # Draw removed object overlays
-  combined = cv2.addWeighted(frame, 0.6, global_heatmap, 0.4, 0)    # Combine global heatmap and overlays
+  while not output_q.empty():
+    fid, processed = output_q.get()
+    output_buffer[fid] = processed
 
-  # Overlay the removed object overlays using masks instead of repeated addWeighted
-  for t, overlay in removed_objects:
-    if frame_count - t < FRAME_BUFFER:
-      mask = cv2.cvtColor(overlay, cv2.COLOR_BGR2GRAY)
-      mask = cv2.threshold(mask, 10, 255, cv2.THRESH_BINARY)[1]
-      inv_mask = cv2.bitwise_not(mask)
+  while frame_id in output_buffer:
+    out.write(output_buffer[frame_id])
+    del output_buffer[frame_id]
+    frame_id += 1
 
-      fg = cv2.bitwise_and(overlay, overlay, mask=mask)
-      bg = cv2.bitwise_and(combined, combined, mask=inv_mask)
-      combined = cv2.add(bg, fg)
-
-  out.write(combined)
-  cv2.imshow('Change Detection', combined)
-  frame_count += 1
-  prev_gray = frame_gray.copy()
-  if cv2.waitKey(1) & 0xFF == 27:
-    break
-
+input_q.put(None)
+worker_thread.join()
 cap.release()
 out.release()
-cv2.destroyAllWindows()
