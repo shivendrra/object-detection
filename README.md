@@ -2,6 +2,8 @@
 
 ## Overview
 
+![main-img.png](https://github.com/shivendrra/object-detection/blob/main/media/main-img.png)
+
 This is a small computer vision project to identify missing & added objects in real time frame. It has two different scripts running two different methods of analyzing the same taks- if something has been removed or added. Lightweight OpenCV based scripts, one with proper GPU acceleration and other works on just CPU.
 
 ## Features
