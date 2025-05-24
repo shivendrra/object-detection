@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+from typing import Union
 
 def apply_global_heatmap(frame, diff_mask, colormap=cv2.COLORMAP_JET, alpha=0.4):
   heatmap = cv2.applyColorMap(diff_mask, colormap)
@@ -44,67 +45,66 @@ def merge_boxes(boxes, overlapThresh=0.3):
     idxs = idxs[np.where(overlap <= overlapThresh)]
   return [boxes[i] for i in pick]
 
-# --- SETTINGS ---
-VIDEO_IN = "data/input.mp4"
-VIDEO_OUT = "data/overlay.mp4"
-RESIZE_W = 640
+def run_motion_overlay(input_source: Union[str, int], output_path: str, resize_width=640, alpha=0.4, show_window=True):
+  cap = cv2.VideoCapture(input_source)
+  ret, reference_frame = cap.read()
+  if not ret: raise RuntimeError("Cannot read input")
 
-cap = cv2.VideoCapture(VIDEO_IN)
-ret, reference_frame = cap.read()
-if not ret: raise RuntimeError("Cannot read video")
+  h0, w0 = reference_frame.shape[:2]
+  h1 = int(h0 * resize_width / w0)
+  fps = cap.get(cv2.CAP_PROP_FPS) or 30
+  reference_frame = cv2.resize(reference_frame, (resize_width, h1))
+  reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
 
-h0, w0 = reference_frame.shape[:2]
-h1 = int(h0 * RESIZE_W / w0)
-fps = cap.get(cv2.CAP_PROP_FPS)
-reference_frame = cv2.resize(reference_frame, (RESIZE_W, h1))
-reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
-out = cv2.VideoWriter(VIDEO_OUT, cv2.VideoWriter_fourcc(*'mp4v'), fps, (RESIZE_W, h1))
+  out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, h1))
 
-while True:
-  ret, frame = cap.read()
-  if not ret: break
+  while True:
+    ret, frame = cap.read()
+    if not ret: break
 
-  frame = cv2.resize(frame, (RESIZE_W, h1))
-  gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-  diff = cv2.absdiff(reference_gray, gray)
-  _, binary_diff = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-  opened = cv2.morphologyEx(binary_diff, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    frame = cv2.resize(frame, (resize_width, h1))
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    diff = cv2.absdiff(reference_gray, gray)
+    _, binary_diff = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+    opened = cv2.morphologyEx(binary_diff, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
-  contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-  raw_boxes = []
-  for cnt in contours:
-    x, y, w, h = cv2.boundingRect(cnt)
-    if w > 20 and h > 20:
-      raw_boxes.append((x, y, w, h))
+    contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    raw_boxes = []
+    for cnt in contours:
+      x, y, w, h = cv2.boundingRect(cnt)
+      if w > 20 and h > 20:
+        raw_boxes.append((x, y, w, h))
 
-  merged_boxes = merge_boxes(raw_boxes)
-  added_mask = np.zeros_like(gray)
-  removed_mask = np.zeros_like(gray)
+    merged_boxes = merge_boxes(raw_boxes)
+    added_mask = np.zeros_like(gray)
+    removed_mask = np.zeros_like(gray)
 
-  for x, y, w, h in merged_boxes:
-    region_ref = reference_gray[y:y+h, x:x+w]
-    region_now = gray[y:y+h, x:x+w]
-    score = np.mean(region_now) - np.mean(region_ref)
+    for x, y, w, h in merged_boxes:
+      region_ref = reference_gray[y:y+h, x:x+w]
+      region_now = gray[y:y+h, x:x+w]
+      score = np.mean(region_now) - np.mean(region_ref)
 
-    if score > 10:
-      # removed
-      label = "Missing object"
-      color = (0, 0, 255)
-      removed_mask[y:y+h, x:x+w] = 255
-    else:
-      # added
-      label = "Added object"
-      color = (0, 255, 0)
-      added_mask[y:y+h, x:x+w] = 255
+      if score > 10:
+        label = "Missing object"
+        color = (0, 0, 255)
+        removed_mask[y:y+h, x:x+w] = 255
+      else:
+        label = "Added object"
+        color = (0, 255, 0)
+        added_mask[y:y+h, x:x+w] = 255
 
-    cv2.rectangle(frame, (x, y), (x+w, y+h), color, 1)
-    cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-  overlay = apply_global_heatmap(frame, diff) # create a global heatmap over the entire frame
-  out.write(overlay)
-  cv2.imshow("Overlay", overlay)
-  if cv2.waitKey(1) & 0xFF == 27:
-    break
+      cv2.rectangle(frame, (x, y), (x+w, y+h), color, 1)
+      cv2.putText(frame, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-cap.release()
-out.release()
-cv2.destroyAllWindows()
+    overlay = apply_global_heatmap(frame, diff, alpha=alpha)
+    out.write(overlay)
+
+    if show_window:
+      cv2.imshow("Overlay", overlay)
+      if cv2.waitKey(1) & 0xFF == 27:
+        break
+
+  cap.release()
+  out.release()
+  if show_window:
+    cv2.destroyAllWindows()
