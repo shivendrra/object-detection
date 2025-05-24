@@ -45,26 +45,41 @@ def merge_boxes(boxes, overlapThresh=0.3):
     idxs = idxs[np.where(overlap <= overlapThresh)]
   return [boxes[i] for i in pick]
 
-def run_motion_overlay(input_source: Union[str, int], output_path: str, resize_width=640, alpha=0.4, show_window=True):
+def run_motion_overlay(input_source: Union[str, int], output_path: str, resize_width=640, alpha=0.4, show_window=True, real_time=True):
   cap = cv2.VideoCapture(input_source)
-  ret, reference_frame = cap.read()
-  if not ret: raise RuntimeError("Cannot read input")
+  ret, frame = cap.read()
+  if not ret:
+    raise RuntimeError("Cannot read input")
 
-  h0, w0 = reference_frame.shape[:2]
+  h0, w0 = frame.shape[:2]
   h1 = int(h0 * resize_width / w0)
   fps = cap.get(cv2.CAP_PROP_FPS) or 30
-  reference_frame = cv2.resize(reference_frame, (resize_width, h1))
-  reference_gray = cv2.cvtColor(reference_frame, cv2.COLOR_BGR2GRAY)
+
+  frame = cv2.resize(frame, (resize_width, h1))
+  gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+  if real_time:
+    background = gray.astype("float")  # adaptive background model
+  else:
+    reference_gray = gray.copy()  # static reference frame
 
   out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (resize_width, h1))
 
   while True:
     ret, frame = cap.read()
-    if not ret: break
+    if not ret:
+      break
 
     frame = cv2.resize(frame, (resize_width, h1))
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    diff = cv2.absdiff(reference_gray, gray)
+
+    if real_time:
+      cv2.accumulateWeighted(gray, background, 0.02)
+      ref_frame = cv2.convertScaleAbs(background)
+    else:
+      ref_frame = reference_gray
+
+    diff = cv2.absdiff(ref_frame, gray)
     _, binary_diff = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
     opened = cv2.morphologyEx(binary_diff, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
 
@@ -80,7 +95,7 @@ def run_motion_overlay(input_source: Union[str, int], output_path: str, resize_w
     removed_mask = np.zeros_like(gray)
 
     for x, y, w, h in merged_boxes:
-      region_ref = reference_gray[y:y+h, x:x+w]
+      region_ref = ref_frame[y:y+h, x:x+w]
       region_now = gray[y:y+h, x:x+w]
       score = np.mean(region_now) - np.mean(region_ref)
 
