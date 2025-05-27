@@ -27,7 +27,8 @@ run_motion_overlay(
   output_path="output.mp4",
   resize_width=640,
   alpha=0.5,
-  show_window=True
+  show_window=True,
+  real_time=False   # keeps the single refrence frame (for False) / keeps changing the refrence frame (for True)
 )
 ```
 

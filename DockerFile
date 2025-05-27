@@ -41,6 +41,6 @@ RUN make -j$(nproc) && make install && ldconfig
 
 # Set working directory and copy scripts
 WORKDIR /app
-COPY script.py detection.py /app/
+COPY script.py detection.py run.py /app/
 
-CMD ["python3", "script.py"]
+CMD ["python3", "script.py", "run.py"]
